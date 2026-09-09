@@ -22,7 +22,17 @@ while [ $# -gt 0 ]; do
     --skill-dir) SKILL_DIR="$2"; shift 2 ;;
     --repo)      REPO_URL="$2"; shift 2 ;;
     -h|--help)
-      sed -n '2,12p' "$0"; exit 0 ;;
+      cat >&2 <<'HELPEOF'
+install.sh — install bitwarden-agent (bwa).
+Options:
+  --prefix DIR       install prefix (default: $HOME/.local)
+  --bws              also install the Secrets Manager CLI
+  --skill-dir DIR    install the drop-in Muse skill here
+                     (default: $HOME/workspace/skills, if it exists)
+  --repo URL         repo to install from
+                     (default: github.com/red4711/bitwarden-agent)
+HELPEOF
+      exit 0 ;;
     *) echo "install.sh: unknown option '$1'" >&2; exit 1 ;;
   esac
 done
