@@ -13,7 +13,7 @@ Muse agents the operating rules.
 
 ```bash
 # one-line install (bwa + bw CLI; add --bws for Secrets Manager CLI)
-curl -fsSL https://raw.githubusercontent.com/red4711/bitwarden-agent/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/red4711/bitwarden-agent/master/install.sh | bash
 
 export PATH="$HOME/.local/bin:$PATH"
 

@@ -274,6 +274,9 @@ bwa_bw_build_item_json() {
 
 cmd_create() {
   local name="${1:?usage: bwa create NAME [options]}"; shift
+  case "$name" in -*)
+    bwa_die "refusing: item name '$name' looks like a flag (did you mean 'bwa help'?)"
+  esac
   parse_item_flags "$@"
   bwa_need_jq; bwa_config_load; bwa_backend_ensure
   case "$BWA_BACKEND" in
@@ -300,6 +303,9 @@ cmd_create() {
 
 cmd_edit() {
   local name="${1:?usage: bwa edit NAME [options]}"; shift
+  case "$name" in -*)
+    bwa_die "refusing: item name '$name' looks like a flag (did you mean 'bwa help'?)"
+  esac
   parse_item_flags "$@"
   bwa_need_jq; bwa_config_load; bwa_backend_ensure
   case "$BWA_BACKEND" in
@@ -348,6 +354,9 @@ cmd_edit() {
 
 cmd_delete() {
   local name="${1:?usage: bwa delete NAME [--yes]}"; shift
+  case "$name" in -*)
+    bwa_die "refusing: item name '$name' looks like a flag (did you mean 'bwa help'?)"
+  esac
   local yes=0
   if [ "${1:-}" = "--yes" ]; then yes=1; fi
   bwa_need_jq; bwa_config_load; bwa_backend_ensure
@@ -378,11 +387,20 @@ cmd_session() {
   case "$mode" in
     --persist)
       [ "$BWA_BACKEND" = "bw" ] || bwa_die "--persist is a bw-backend concept (bws is stateless)"
+      local _pw_prompted=0
+      if [ -z "${BW_PASSWORD:-}" ]; then
+        [ -t 0 ] || bwa_die "BW_PASSWORD is not set and stdin is not a terminal; export BW_PASSWORD or run interactively"
+        bwa_prompt_secret "master password (unlocks the vault to create the session)"
+        export BW_PASSWORD="$REPLY_RAW"
+        unset REPLY_RAW
+        _pw_prompted=1
+      fi
       bwa_backend_ensure
       mkdir -p "$BWA_CONFIG_DIR"
       printf '%s' "$BW_SESSION" >"$BWA_SESSION_FILE"
       chmod 600 "$BWA_SESSION_FILE"
       bwa_log "session stored at $BWA_SESSION_FILE (0600). Anyone who can read it can read your vault."
+      [ "$_pw_prompted" -eq 1 ] && unset BW_PASSWORD
       ;;
     --clear)
       rm -f "$BWA_SESSION_FILE"

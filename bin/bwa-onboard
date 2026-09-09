@@ -255,11 +255,10 @@ main() {
     AUTH="token"
     collect_secrets_bws
   fi
-  write_config
   if [ "$BACKEND" = "bws" ]; then
     pick_bws_project
-    write_config   # rewrite with the chosen project
   fi
+  write_config
   smoke_test
   ask_session_persist
   next_steps

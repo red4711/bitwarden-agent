@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # install.sh — one-line installer for bitwarden-agent (bwa).
 #
-#   curl -fsSL https://raw.githubusercontent.com/red4711/bitwarden-agent/main/install.sh | bash
+#   curl -fsSL https://raw.githubusercontent.com/red4711/bitwarden-agent/master/install.sh | bash
 #   curl -fsSL .../install.sh | bash -s -- --bws --skill-dir ~/workspace/skills
 #
 # Installs: bwa + bwa-onboard into $PREFIX/bin, lib files into $PREFIX/lib,
@@ -57,9 +57,9 @@ elif have git; then
   SRC="$TMPDIR/repo"
 else
   log "downloading tarball ..."
-  curl -fsSL "$REPO_URL/archive/refs/heads/main.tar.gz" \
+  curl -fsSL "$REPO_URL/archive/refs/heads/master.tar.gz" \
     | tar -xz -C "$TMPDIR" || die "tarball download failed"
-  SRC="$TMPDIR/bitwarden-agent-main"
+  SRC="$TMPDIR/bitwarden-agent-master"
 fi
 [ -f "$SRC/bin/bwa" ] || die "repo layout unexpected (bin/bwa missing)"
 
