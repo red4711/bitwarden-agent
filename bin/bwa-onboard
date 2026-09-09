@@ -1,0 +1,268 @@
+#!/usr/bin/env bash
+# bwa-onboard — interactive setup wizard for bwa.
+#
+# Walks through the server x auth matrix:
+#   server: Bitwarden cloud (US/EU) | self-hosted Vaultwarden
+#   auth:   API key (recommended) | email + master password   (bw backend)
+#   - or - Secrets Manager machine access token              (bws backend, cloud only)
+#
+# Secrets are collected via hidden prompts, used once for the smoke test,
+# and NEVER written to disk. The config file holds no secrets.
+
+set -euo pipefail
+
+BWA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck disable=SC1091
+. "$BWA_ROOT/lib/bwa-common.sh"
+# shellcheck disable=SC1091
+. "$BWA_ROOT/lib/bwa-backends.sh"
+
+CLOUD_US="https://vault.bitwarden.com"
+CLOUD_EU="https://vault.bitwarden.eu"
+
+banner() {
+  cat >&2 <<'EOF'
+  ____ __      __ ___ 
+ | __ ) \    / // _ \    bitwarden-agent setup
+ |  _ \\ \/\/ /| |_| |   Bitwarden as an operational secret store
+ | |_) |\    / |  _  |   for AI agents (and humans too).
+ |____/  \/\/  |_| |_|
+
+Secrets you type here are used once and never written to disk.
+EOF
+}
+
+choose_backend() {
+  bwa_log "Backends:"
+  bwa_log "  1) bw  — password-manager CLI. Works with Bitwarden cloud AND"
+  bwa_log "           self-hosted Vaultwarden. Full item types. (recommended)"
+  bwa_log "  2) bws — Secrets Manager CLI. Bitwarden cloud ONLY."
+  bwa_log "           Single machine access token, no master password, no unlock."
+  bwa_prompt "backend [1/2]" "1"
+  case "$REPLY_RAW" in
+    1|bw)  BACKEND="bw" ;;
+    2|bws) BACKEND="bws" ;;
+    *) bwa_die "pick 1 or 2" ;;
+  esac
+}
+
+choose_server() {
+  if [ "$BACKEND" = "bws" ]; then
+    bwa_log "Secrets Manager is a Bitwarden cloud feature — Vaultwarden does"
+    bwa_log "not implement its API, so self-hosted is not an option here."
+    bwa_prompt "cloud region [us/eu]" "us"
+    case "$REPLY_RAW" in
+      us|US) SERVER="$CLOUD_US" ;;
+      eu|EU) SERVER="$CLOUD_EU" ;;
+      *) bwa_die "pick us or eu" ;;
+    esac
+    return 0
+  fi
+  bwa_log "Servers:"
+  bwa_log "  1) Bitwarden cloud (US) — $CLOUD_US"
+  bwa_log "  2) Bitwarden cloud (EU) — $CLOUD_EU"
+  bwa_log "  3) Self-hosted Vaultwarden — your own URL"
+  bwa_prompt "server [1/2/3]" "1"
+  case "$REPLY_RAW" in
+    1) SERVER="$CLOUD_US" ;;
+    2) SERVER="$CLOUD_EU" ;;
+    3) bwa_prompt "Vaultwarden URL (https://...)"
+       SERVER="$REPLY_RAW"
+       [[ "$SERVER" =~ ^https:// ]] || bwa_die "URL must start with https://"
+       SELFHOSTED=1
+       ;;
+    *) bwa_die "pick 1, 2 or 3" ;;
+  esac
+}
+
+vaultwarden_checklist() {
+  [ "${SELFHOSTED:-0}" = "1" ] || return 0
+  cat >&2 <<'EOF'
+
+  Vaultwarden prep (do this in the web vault first):
+    1. Create an Organization for automation (e.g. "homelab").
+    2. Inside it, create ONE Collection for the agent (e.g. "lassie").
+    3. Create a dedicated user account for the agent (NOT your personal one).
+    4. Invite that user to the organization, granting access to ONLY that
+       collection (can create/edit items). It must not see your personal vault.
+    5. Log in as the agent user -> Settings -> Security -> Keys -> API key,
+       and note the client_id + client_secret.
+    6. Enable two-step login on the agent account (API-key login skips the
+       2FA prompt, so automation keeps working).
+
+EOF
+  bwa_prompt_yn "is the agent account ready?" "y" \
+    || bwa_die "set up the Vaultwarden side first, then re-run: bwa onboard"
+}
+
+choose_auth_bw() {
+  cat >&2 <<'EOF'
+  Auth methods:
+    API key (recommended for machines): client_id + client_secret proves who
+      you are to the server and skips the 2FA prompt. NOTE: unlocking the
+      vault still needs the master password every time — that's the
+      zero-knowledge design (login authenticates, the password decrypts).
+    Email + password: classic login. Fine for interactive use.
+EOF
+  bwa_prompt "auth [apikey/password]" "apikey"
+  case "$REPLY_RAW" in
+    apikey)   AUTH="apikey" ;;
+    password) AUTH="password" ;;
+    *) bwa_die "pick apikey or password" ;;
+  esac
+}
+
+collect_secrets_bw() {
+  bwa_prompt "account email (label; login id for password auth)"
+  EMAIL="$REPLY_RAW"
+  [ -n "$EMAIL" ] || bwa_die "email is required"
+  if [ "$AUTH" = "apikey" ]; then
+    bwa_log "from Settings -> Security -> Keys -> API key:"
+    bwa_prompt_secret "client_id";     BW_CLIENTID="$REPLY_RAW"
+    bwa_prompt_secret "client_secret"; BW_CLIENTSECRET="$REPLY_RAW"
+    [ -n "$BW_CLIENTID" ] && [ -n "$BW_CLIENTSECRET" ] \
+      || bwa_die "client_id and client_secret are required"
+    export BW_CLIENTID BW_CLIENTSECRET
+  fi
+  bwa_prompt_secret "master password (needed to UNLOCK, even with API-key login)"
+  BW_PASSWORD="$REPLY_RAW"
+  [ -n "$BW_PASSWORD" ] || bwa_die "master password is required"
+  export BW_PASSWORD
+}
+
+collect_secrets_bws() {
+  bwa_log "from Secrets Manager -> Machine accounts -> <account> -> Access tokens:"
+  bwa_prompt_secret "access token (starts with 0.)"
+  BWS_ACCESS_TOKEN="$REPLY_RAW"
+  [ -n "$BWS_ACCESS_TOKEN" ] || bwa_die "access token is required"
+  export BWS_ACCESS_TOKEN
+  export BWS_SERVER_URL="$SERVER"
+}
+
+pick_bws_project() {
+  local list n
+  list="$(bws project list 2>/dev/null || true)"
+  n="$(jq -r 'length' <<<"$list" 2>/dev/null || echo 0)"
+  if [ "$n" -eq 0 ]; then
+    bwa_log "no projects visible to this token — create one in the web UI later."
+    PROJECT_ID=""
+    return 0
+  fi
+  bwa_log "projects visible to this token:"
+  jq -r 'to_entries[] | "  \(.key + 1)) \(.value.name) (\(.value.id))"' <<<"$list"
+  bwa_prompt "default project number (blank to skip)" ""
+  if [ -n "$REPLY_RAW" ] && [[ "$REPLY_RAW" =~ ^[0-9]+$ ]]; then
+    PROJECT_ID="$(jq -r --argjson i "$REPLY_RAW" '.[$i - 1].id // ""' <<<"$list")"
+    [ -n "$PROJECT_ID" ] || bwa_die "no such project"
+  else
+    PROJECT_ID=""
+  fi
+}
+
+write_config() {
+  mkdir -p "$BWA_CONFIG_DIR"
+  if [ -f "$BWA_CONFIG_FILE" ]; then
+    bwa_prompt_yn "config exists at $BWA_CONFIG_FILE — overwrite?" "n" \
+      || bwa_die "aborted"
+  fi
+  cat >"$BWA_CONFIG_FILE" <<EOF
+# written by bwa onboard on $(date -u +%FT%TZ). No secrets are stored here.
+BWA_BACKEND="$BACKEND"
+BWA_SERVER="$SERVER"
+BWA_AUTH="$AUTH"
+BWA_EMAIL="$EMAIL"
+BWA_PROJECT_ID="${PROJECT_ID:-}"
+EOF
+  chmod 600 "$BWA_CONFIG_FILE"
+  bwa_log "wrote $BWA_CONFIG_FILE"
+}
+
+smoke_test() {
+  bwa_log "smoke test ..."
+  bwa_config_load
+  bwa_backend_ensure
+  case "$BWA_BACKEND" in
+    bw)
+      bw sync --session "$BW_SESSION" >/dev/null
+      local n
+      n="$(bw list items --session "$BW_SESSION" | jq 'length')"
+      bwa_log "OK: logged in, vault unlocked, synced. $n item(s) visible."
+      ;;
+    bws)
+      local n
+      n="$(bws project list | jq 'length')"
+      bwa_log "OK: token works. $n project(s) visible."
+      ;;
+  esac
+  # Scrub secrets from this shell before continuing.
+  unset BW_CLIENTID BW_CLIENTSECRET BW_PASSWORD BWS_ACCESS_TOKEN REPLY_RAW 2>/dev/null || true
+}
+
+ask_session_persist() {
+  [ "$BWA_BACKEND" = "bw" ] || return 0
+  cat >&2 <<'EOF'
+
+  Session handling: the vault locks when this process exits. Options:
+    - per-invocation unlock (default): each bwa call needs BW_PASSWORD
+      (and API key, if used) in the environment. Nothing secret on disk.
+    - persisted session: store the session key in a 0600 file. Convenient
+      for cron jobs; anyone who can read the file can read your vault.
+EOF
+  if bwa_prompt_yn "persist the session key to a 0600 file?" "n"; then
+    bwa_prompt_secret "master password (one more time, to create the session)"
+    export BW_PASSWORD="$REPLY_RAW"
+    unset REPLY_RAW
+    bwa_backend_ensure
+    mkdir -p "$BWA_CONFIG_DIR"
+    printf '%s' "$BW_SESSION" >"$BWA_SESSION_FILE"
+    chmod 600 "$BWA_SESSION_FILE"
+    unset BW_PASSWORD BW_SESSION
+    bwa_log "session stored at $BWA_SESSION_FILE"
+  else
+    bwa_log "not persisted. Export BW_PASSWORD (and API key) per invocation,"
+    bwa_log "or use: bwa exec -- <your command>"
+  fi
+}
+
+next_steps() {
+  cat >&2 <<EOF
+
+  Done. Try it:
+    bwa status
+    bwa list
+    bwa get "some item" --field password
+    bwa exec -- ./my-deploy-script.sh     # secrets stay out of logs
+
+  For scheduled jobs, keep access warm:
+    */15 * * * * /path/to/bwa sync >/dev/null 2>&1
+
+  Your harness (Muse skill, keychain, CI secret store) should inject
+  BW_CLIENTID / BW_CLIENTSECRET / BW_PASSWORD (or BWS_ACCESS_TOKEN)
+  into the environment at runtime — never into files or chat.
+EOF
+}
+
+main() {
+  local BACKEND="" SERVER="" AUTH="password" EMAIL="" PROJECT_ID="" SELFHOSTED=0
+  banner
+  choose_backend
+  choose_server
+  vaultwarden_checklist
+  if [ "$BACKEND" = "bw" ]; then
+    choose_auth_bw
+    collect_secrets_bw
+  else
+    AUTH="token"
+    collect_secrets_bws
+  fi
+  write_config
+  if [ "$BACKEND" = "bws" ]; then
+    pick_bws_project
+    write_config   # rewrite with the chosen project
+  fi
+  smoke_test
+  ask_session_persist
+  next_steps
+}
+
+main "$@"

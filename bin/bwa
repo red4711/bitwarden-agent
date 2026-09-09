@@ -1,0 +1,435 @@
+#!/usr/bin/env bash
+# bwa — Bitwarden as an operational secret store for agents.
+#
+# Backends: bw (Bitwarden cloud US/EU or self-hosted Vaultwarden) and
+# bws (Bitwarden Secrets Manager, cloud only).
+#
+# Security: secrets travel only via environment or hidden prompts.
+# bwa never writes a secret to disk (except `bwa session --persist`,
+# which is an explicit opt-in), never echoes one, never runs `set -x`.
+
+set -euo pipefail
+
+BWA_VERSION="0.1.0"
+BWA_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# shellcheck disable=SC1091
+. "$BWA_ROOT/lib/bwa-common.sh"
+# shellcheck disable=SC1091
+. "$BWA_ROOT/lib/bwa-backends.sh"
+
+usage() {
+  cat <<'EOF'
+bwa — Bitwarden as an operational secret store for agents.
+
+Usage:
+  bwa onboard                  Interactive setup wizard (server x auth matrix)
+  bwa doctor                   Check binaries, config, server reachability
+  bwa status                   Show backend/server/login/session state
+  bwa sync                     Pull latest vault state (bw backend)
+
+  bwa get NAME [--field F]      Print an item (bw) or secret value (bws).
+                               bw fields: username|password|uri|notes|totp
+                               or a custom-field name. Default: full item JSON.
+                               bws fields: value|note|key. Default: value.
+  bwa list                     List item/secret names (no values)
+  bwa create NAME [opts]        Create an item/secret
+  bwa edit NAME [opts]          Edit an item/secret
+  bwa delete NAME [--yes]       Delete an item/secret
+
+  create/edit opts (bw):  --username U --password P | --generate [--length N]
+                          --url URL --notes TEXT --folder NAME --field k=v
+  create/edit opts (bws): --value V | --generate [--length N] --note TEXT
+                          --key NEWNAME (edit: rename)
+
+  bwa session --persist        Unlock now and store the session key in a
+                               0600 file for later invocations (opt-in)
+  bwa session --clear          Remove the stored session and lock the vault
+  bwa session --export         Print `export BW_SESSION=...` (eval it;
+                               lands in shell history — prefer --persist)
+
+  bwa exec -- CMD [ARGS...]     Ensure auth, then exec CMD with the session
+                               in the environment (keeps values out of logs)
+
+  bwa help | bwa version
+
+Auth material comes ONLY from the environment:
+  bw:  BW_CLIENTID + BW_CLIENTSECRET (API key) and/or BW_PASSWORD (master
+       password — always required to UNLOCK, even with API-key login)
+       BWA_EMAIL is read from the config file (not secret).
+  bws: BWS_ACCESS_TOKEN, optional BWS_SERVER_URL / BWS_PROJECT_ID.
+
+Run `bwa onboard` first.
+EOF
+}
+
+# ---------- helpers ----------
+
+bwa_need_jq() {
+  bwa_have jq || bwa_die "jq is required for item operations. Install jq and retry."
+}
+
+# bw: resolve an exact item name to its id. Dies on zero/ambiguous matches.
+bwa_bw_find_id() {
+  local name="$1" ids n
+  ids="$(bw list items --search "$name" --session "$BW_SESSION" \
+    | jq -r --arg n "$name" '.[] | select(.name == $n) | .id')"
+  n="$(printf '%s\n' "$ids" | grep -c . || true)"
+  [ "$n" -gt 0 ] || bwa_die "no item named '$name'"
+  [ "$n" -eq 1 ] || bwa_die "ambiguous name '$name' matches $n items; rename first"
+  printf '%s' "$ids"
+}
+
+bwa_bw_folder_id() {
+  local folder="$1"
+  bw list folders --search "$folder" --session "$BW_SESSION" \
+    | jq -r --arg f "$folder" '.[] | select(.name == $f) | .id' | head -1
+}
+
+bwa_gen_password() {
+  local length="${1:-32}"
+  bw generate -ulns --length "$length"
+}
+
+# ---------- status / doctor / sync ----------
+
+cmd_status() {
+  bwa_config_load
+  printf 'backend : %s\nserver  : %s\nauth    : %s\n' "$BWA_BACKEND" "$BWA_SERVER" "$BWA_AUTH"
+  [ -n "${BWA_EMAIL:-}" ] && printf 'email   : %s\n' "$BWA_EMAIL"
+  [ -n "${BWA_PROJECT_ID:-}" ] && printf 'project : %s\n' "$BWA_PROJECT_ID"
+  case "$BWA_BACKEND" in
+    bw)
+      bwa_have bw || bwa_die "bw CLI not installed"
+      if bw login --check >/dev/null 2>&1; then printf 'login   : %s\n' "yes"; else printf 'login   : %s\n' "no"; fi
+      if [ -n "${BW_SESSION:-}" ]; then
+        bwa_bw_session_valid && printf 'session : %s\n' "valid (BW_SESSION)" \
+          || printf 'session : %s\n' "INVALID (BW_SESSION rejected)"
+      elif [ -f "$BWA_SESSION_FILE" ]; then
+        BW_SESSION="$(cat "$BWA_SESSION_FILE")"; export BW_SESSION
+        bwa_bw_session_valid && printf 'session : %s\n' "valid (stored file)" \
+          || printf 'session : %s\n' "STALE (stored file rejected)"
+        unset BW_SESSION
+      else
+        printf 'session : %s\n' "none (will unlock from BW_PASSWORD)"
+      fi
+      ;;
+    bws)
+      bwa_have bws || bwa_die "bws CLI not installed"
+      if [ -n "${BWS_ACCESS_TOKEN:-}" ]; then printf 'token   : %s\n' "present (BWS_ACCESS_TOKEN)"; else printf 'token   : %s\n' "MISSING"; fi
+      ;;
+  esac
+}
+
+cmd_doctor() {
+  local fail=0
+  say() { printf '%-28s %s\n' "$1" "$2"; }
+  if bwa_have bw; then say "bw CLI" "OK ($(bw --version 2>/dev/null || echo ?))"; else say "bw CLI" "MISSING"; fi
+  if bwa_have bws; then say "bws CLI" "OK"; else say "bws CLI" "not installed (only needed for bws backend)"; fi
+  if bwa_have jq; then say "jq" "OK"; else say "jq" "MISSING"; fail=1; fi
+  if [ -f "$BWA_CONFIG_FILE" ]; then
+    say "config" "OK ($BWA_CONFIG_FILE)"
+    bwa_config_load
+    say "backend/auth" "$BWA_BACKEND / $BWA_AUTH"
+    local code
+    code="$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$BWA_SERVER" || echo 000)"
+    if [ "$code" = "200" ]; then say "server reachable" "OK ($BWA_SERVER)"; else say "server reachable" "FAIL (HTTP $code)"; fail=1; fi
+    if [ "$BWA_BACKEND" = "bws" ] && [ "$BWA_SERVER" != "https://vault.bitwarden.com" ] && [ "$BWA_SERVER" != "https://vault.bitwarden.eu" ]; then
+      say "bws on self-hosted" "FAIL (Secrets Manager API is cloud-only; Vaultwarden does not implement it)"
+      fail=1
+    fi
+  else
+    say "config" "MISSING (run: bwa onboard)"; fail=1
+  fi
+  return $fail
+}
+
+cmd_sync() {
+  bwa_config_load
+  case "$BWA_BACKEND" in
+    bw) bwa_backend_ensure; bw sync --session "$BW_SESSION" ;;
+    bws) bwa_log "bws is stateless — every call reads live; nothing to sync." ;;
+  esac
+}
+
+# ---------- get / list ----------
+
+cmd_get() {
+  local name="${1:?usage: bwa get NAME [--field FIELD]}"; shift
+  local field=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --field) field="${2:?--field needs a value}"; shift 2 ;;
+      *) bwa_die "unknown flag: $1" ;;
+    esac
+  done
+  bwa_need_jq; bwa_config_load; bwa_backend_ensure
+  case "$BWA_BACKEND" in
+    bw)
+      local id item
+      id="$(bwa_bw_find_id "$name")"
+      item="$(bw get item "$id" --session "$BW_SESSION")"
+      case "$field" in
+        "")        printf '%s\n' "$item" ;;
+        username)  jq -r '.login.username // ""' <<<"$item" ;;
+        password)  jq -r '.login.password // ""' <<<"$item" ;;
+        uri)       jq -r '.login.uris[0].uri // ""' <<<"$item" ;;
+        notes)     jq -r '.notes // ""' <<<"$item" ;;
+        totp)      jq -r '.login.totp // ""' <<<"$item" ;;
+        *)         jq -r --arg f "$field" '.fields // [] | map(select(.name == $f)) | .[0].value // ""' <<<"$item" ;;
+      esac
+      ;;
+    bws)
+      local id="${BWA_BWS_ID_HINT:-}"
+      if [ -z "$id" ]; then
+        id="$(bws secret list | jq -r --arg n "$name" '.[] | select(.key == $n) | .id' | head -1)"
+      fi
+      [ -n "$id" ] || bwa_die "no secret named '$name'"
+      local secret
+      secret="$(bws secret get "$id")"
+      case "${field:-value}" in
+        value) jq -r '.value' <<<"$secret" ;;
+        note)  jq -r '.note // ""' <<<"$secret" ;;
+        key)   jq -r '.key' <<<"$secret" ;;
+        *)     bwa_die "unknown bws field '$field' (want: value|note|key)" ;;
+      esac
+      ;;
+  esac
+}
+
+cmd_list() {
+  bwa_need_jq; bwa_config_load; bwa_backend_ensure
+  case "$BWA_BACKEND" in
+    bw)
+      bw list items --session "$BW_SESSION" \
+        | jq -r '.[] | "\(.name)\t\(.login.username // "-")\t\(.id)"'
+      ;;
+    bws)
+      bws secret list | jq -r '.[] | "\(.key)\t\(.id)"'
+      ;;
+  esac
+}
+
+# ---------- create / edit / delete ----------
+
+# Parse shared create/edit flags into globals: F_USERNAME F_PASSWORD F_GENERATE
+# F_LENGTH F_URL F_NOTES F_FOLDER F_FIELDS (newline-separated k=v) F_VALUE F_NOTE F_KEY
+parse_item_flags() {
+  F_USERNAME=""; F_PASSWORD=""; F_GENERATE=0; F_LENGTH=32
+  F_URL=""; F_NOTES=""; F_FOLDER=""; F_FIELDS=""; F_VALUE=""; F_NOTE=""; F_KEY=""
+  while [ $# -gt 0 ]; do
+    case "$1" in
+      --username) F_USERNAME="$2"; shift 2 ;;
+      --password) F_PASSWORD="$2"; shift 2 ;;
+      --generate) F_GENERATE=1; shift ;;
+      --length)   F_LENGTH="$2"; shift 2 ;;
+      --url)      F_URL="$2"; shift 2 ;;
+      --notes)    F_NOTES="$2"; shift 2 ;;
+      --folder)   F_FOLDER="$2"; shift 2 ;;
+      --field)    F_FIELDS="$(printf '%s\n%s' "$F_FIELDS" "$2")"; shift 2 ;;
+      --value)    F_VALUE="$2"; shift 2 ;;
+      --note)     F_NOTE="$2"; shift 2 ;;
+      --key)      F_KEY="$2"; shift 2 ;;
+      *) bwa_die "unknown flag: $1" ;;
+    esac
+  done
+}
+
+bwa_bw_build_item_json() {
+  # $1=name. Uses F_* globals. Prints item JSON (not encoded).
+  local name="$1" item login pw
+  if [ "$F_GENERATE" -eq 1 ] && [ -z "$F_PASSWORD" ]; then
+    pw="$(bwa_gen_password "$F_LENGTH")"
+  else
+    pw="$F_PASSWORD"
+  fi
+  item="$(bw get template item --session "$BW_SESSION")"
+  login="$(bw get template item.login --session "$BW_SESSION")"
+  item="$(jq --arg n "$name" '.name = $n | .type = 1' <<<"$item")"
+  login="$(jq --arg u "$F_USERNAME" --arg p "$pw" \
+    '.username = $u | .password = $p' <<<"$login")"
+  if [ -n "$F_URL" ]; then
+    login="$(jq --arg u "$F_URL" \
+      '.uris = [{match: null, uri: $u}]' <<<"$login")"
+  fi
+  item="$(jq --argjson l "$login" '.login = $l' <<<"$item")"
+  [ -n "$F_NOTES" ] && item="$(jq --arg n "$F_NOTES" '.notes = $n' <<<"$item")"
+  if [ -n "$F_FOLDER" ]; then
+    local fid
+    fid="$(bwa_bw_folder_id "$F_FOLDER")"
+    [ -n "$fid" ] || bwa_die "no folder named '$F_FOLDER'"
+    item="$(jq --arg f "$fid" '.folderId = $f' <<<"$item")"
+  fi
+  if [ -n "$F_FIELDS" ]; then
+    local k v fields="[]"
+    while IFS= read -r kv; do
+      [ -z "$kv" ] && continue
+      k="${kv%%=*}"; v="${kv#*=}"
+      fields="$(jq --arg k "$k" --arg v "$v" \
+        '. + [{name: $k, value: $v, type: 0}]' <<<"$fields")"
+    done <<<"$F_FIELDS"
+    item="$(jq --argjson f "$fields" '.fields = $f' <<<"$item")"
+  fi
+  printf '%s' "$item"
+}
+
+cmd_create() {
+  local name="${1:?usage: bwa create NAME [options]}"; shift
+  parse_item_flags "$@"
+  bwa_need_jq; bwa_config_load; bwa_backend_ensure
+  case "$BWA_BACKEND" in
+    bw)
+      local val
+      val="$(bwa_bw_build_item_json "$name" | bw encode | bw create item --session "$BW_SESSION")"
+      jq -r '"created: \(.name) (\(.id))"' <<<"$val"
+      ;;
+    bws)
+      : "${BWS_PROJECT_ID:?set BWS_PROJECT_ID in config or env (Secrets Manager is project-scoped)}"
+      local v="$F_VALUE"
+      if [ "$F_GENERATE" -eq 1 ] && [ -z "$v" ]; then
+        v="$(head -c 48 /dev/urandom | base64 | tr -d '\n' | cut -c1-"$F_LENGTH")"
+      fi
+      [ -n "$v" ] || bwa_die "nothing to store: pass --value or --generate"
+      if [ -n "$F_NOTE" ]; then
+        bws secret create "$name" "$v" --project-id "$BWS_PROJECT_ID" --note "$F_NOTE"
+      else
+        bws secret create "$name" "$v" --project-id "$BWS_PROJECT_ID"
+      fi
+      ;;
+  esac
+}
+
+cmd_edit() {
+  local name="${1:?usage: bwa edit NAME [options]}"; shift
+  parse_item_flags "$@"
+  bwa_need_jq; bwa_config_load; bwa_backend_ensure
+  case "$BWA_BACKEND" in
+    bw)
+      local id item
+      id="$(bwa_bw_find_id "$name")"
+      item="$(bw get item "$id" --session "$BW_SESSION")"
+      [ -n "$F_USERNAME" ] && item="$(jq --arg u "$F_USERNAME" '.login.username = $u' <<<"$item")"
+      if [ "$F_GENERATE" -eq 1 ]; then
+        F_PASSWORD="$(bwa_gen_password "$F_LENGTH")"
+      fi
+      [ -n "$F_PASSWORD" ] && item="$(jq --arg p "$F_PASSWORD" '.login.password = $p' <<<"$item")"
+      [ -n "$F_URL" ] && item="$(jq --arg u "$F_URL" '.login.uris = [{match: null, uri: $u}]' <<<"$item")"
+      [ -n "$F_NOTES" ] && item="$(jq --arg n "$F_NOTES" '.notes = $n' <<<"$item")"
+      if [ -n "$F_FIELDS" ]; then
+        local k v
+        while IFS= read -r kv; do
+          [ -z "$kv" ] && continue
+          k="${kv%%=*}"; v="${kv#*=}"
+          item="$(jq --arg k "$k" --arg v "$v" \
+            '(.fields //= []) |= (map(select(.name != $k)) + [{name: $k, value: $v, type: 0}])' <<<"$item")"
+        done <<<"$F_FIELDS"
+      fi
+      # strip server-managed keys the API rejects on edit
+      item="$(jq 'del(.revisionDate)' <<<"$item")"
+      printf '%s' "$item" | bw encode | bw edit item "$id" --session "$BW_SESSION" >/dev/null
+      bwa_log "updated '$name'"
+      ;;
+    bws)
+      local id
+      id="$(bws secret list | jq -r --arg n "$name" '.[] | select(.key == $n) | .id' | head -1)"
+      [ -n "$id" ] || bwa_die "no secret named '$name'"
+      local args=()
+      if [ "$F_GENERATE" -eq 1 ]; then
+        F_VALUE="$(head -c 48 /dev/urandom | base64 | tr -d '\n' | cut -c1-"$F_LENGTH")"
+      fi
+      [ -n "$F_VALUE" ] && args+=(--value "$F_VALUE")
+      [ -n "$F_KEY" ] && args+=(--key "$F_KEY")
+      [ -n "$F_NOTE" ] && args+=(--note "$F_NOTE")
+      [ "${#args[@]}" -gt 0 ] || bwa_die "nothing to change"
+      bws secret edit "$id" "${args[@]}" >/dev/null
+      bwa_log "updated '$name'"
+      ;;
+  esac
+}
+
+cmd_delete() {
+  local name="${1:?usage: bwa delete NAME [--yes]}"; shift
+  local yes=0
+  if [ "${1:-}" = "--yes" ]; then yes=1; fi
+  bwa_need_jq; bwa_config_load; bwa_backend_ensure
+  if [ "$yes" -eq 0 ]; then
+    bwa_prompt_yn "delete '$name'?" "n" || bwa_die "aborted"
+  fi
+  case "$BWA_BACKEND" in
+    bw)
+      local id
+      id="$(bwa_bw_find_id "$name")"
+      bw delete item "$id" --session "$BW_SESSION" >/dev/null
+      ;;
+    bws)
+      local id
+      id="$(bws secret list | jq -r --arg n "$name" '.[] | select(.key == $n) | .id' | head -1)"
+      [ -n "$id" ] || bwa_die "no secret named '$name'"
+      bws secret delete "$id" >/dev/null
+      ;;
+  esac
+  bwa_log "deleted '$name'"
+}
+
+# ---------- session ----------
+
+cmd_session() {
+  local mode="${1:---help}"
+  bwa_config_load
+  case "$mode" in
+    --persist)
+      [ "$BWA_BACKEND" = "bw" ] || bwa_die "--persist is a bw-backend concept (bws is stateless)"
+      bwa_backend_ensure
+      mkdir -p "$BWA_CONFIG_DIR"
+      printf '%s' "$BW_SESSION" >"$BWA_SESSION_FILE"
+      chmod 600 "$BWA_SESSION_FILE"
+      bwa_log "session stored at $BWA_SESSION_FILE (0600). Anyone who can read it can read your vault."
+      ;;
+    --clear)
+      rm -f "$BWA_SESSION_FILE"
+      if [ "$BWA_BACKEND" = "bw" ] && bwa_have bw; then bw lock >/dev/null 2>&1 || true; fi
+      bwa_log "session cleared"
+      ;;
+    --export)
+      [ "$BWA_BACKEND" = "bw" ] || bwa_die "--export is a bw-backend concept (bws is stateless)"
+      bwa_backend_ensure
+      printf 'export BW_SESSION=%q\n' "$BW_SESSION"
+      bwa_log "warning: this lands in shell history; 'eval \"$(basename "$0") session --export\"' on one line, or prefer --persist"
+      ;;
+    *) bwa_die "usage: bwa session --persist | --clear | --export" ;;
+  esac
+}
+
+# ---------- exec ----------
+
+cmd_exec() {
+  if [ "${1:-}" = "--" ]; then shift; fi
+  [ $# -gt 0 ] || bwa_die "usage: bwa exec -- CMD [ARGS...]"
+  bwa_config_load
+  bwa_backend_ensure
+  exec "$@"
+}
+
+# ---------- dispatch ----------
+
+main() {
+  local cmd="${1:-help}"
+  if [ $# -gt 0 ]; then shift; fi
+  case "$cmd" in
+    onboard)  exec "$BWA_ROOT/bin/bwa-onboard" "$@" ;;
+    doctor)   cmd_doctor ;;
+    status)   cmd_status ;;
+    sync)     cmd_sync ;;
+    get)      cmd_get "$@" ;;
+    list)     cmd_list "$@" ;;
+    create)   cmd_create "$@" ;;
+    edit)     cmd_edit "$@" ;;
+    delete)   cmd_delete "$@" ;;
+    session)  cmd_session "$@" ;;
+    exec)     cmd_exec "$@" ;;
+    version)  printf 'bwa %s\n' "$BWA_VERSION" ;;
+    help|--help|-h) usage ;;
+    *) bwa_die "unknown command '$cmd'. Try: bwa help" ;;
+  esac
+}
+
+main "$@"
